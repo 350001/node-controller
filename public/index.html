@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Xray Gateway</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+    <div class="card">
+        <h1>⚡ Xray Gateway</h1>
+        <div class="sub">WebSocket Tunnel</div>
+        <div class="status">
+            <span id="statusIcon">⏳</span>
+            <span id="statusText">Checking...</span>
+        </div>
+        <div class="qr">
+            <div id="qrcode"></div>
+        </div>
+        <div class="info">
+            <div class="row">
+                <span class="key">Config</span>
+                <span id="config-link" class="val">N/A</span>
+            </div>
+        </div>
+        <div class="timer">
+            <span id="timerLabel">Status:</span>
+            <span id="countdown">--</span>
+        </div>
+        <button id="actionButton">
+            Loading...
+        </button>
+        <div class="footer">Xray · WARP · Cloudflare</div>
+    </div>
+    <script src="/assets/libs/qrcode.min.js"></script>
+    <script src="/assets/app.js"></script>
+</body>
+</html>

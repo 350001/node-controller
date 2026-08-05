@@ -1,0 +1,18 @@
+name = "node-controller"
+main = "src/index.js"
+compatibility_date = "2024-12-18"
+
+[assets]
+directory = "./public"
+run_worker_first = ["/nodes","/nodes/*","/task/done","/node/online","/scheduler/reset"]
+not_found_handling = "404-page"
+
+[[kv_namespaces]]
+binding = "NODE_KV"
+id = "9532c2820e6243bba9a0ef80c3c08e44"
+
+[build]
+command = "npm install --registry=https://registry.npmmirror.com"
+
+[vars]
+CONTROLLER_URL = "https://controller.zhongguotaiwan.eu.org"

@@ -1,0 +1,11 @@
+{
+  "name": "node-controller",
+  "version": "1.0.0",
+  "description": "Control Plane for GitHub Actions Nodes - Pure JS encryption",
+  "type": "module",
+  "dependencies": {
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1",
+    "tweetnacl-sealedbox-js": "^1.0.0"
+  }
+}

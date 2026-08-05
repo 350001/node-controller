@@ -2,6 +2,7 @@
 //  node-controller - Production Stable
 //  Direct cancel via GitHub API
 //  GH_TOKEN is written via updateGithubTokenSecret on addNode
+//  Scheduling uses node list order, no scheduler:last
 // ============================================================
 
 import * as sealedbox from 'tweetnacl-sealedbox-js';
@@ -116,7 +117,7 @@ export default {
       if (!authToken || authToken !== env.ADMIN_KEY) {
         return json({ error: 'Unauthorized' }, 401);
       }
-      await env.NODE_KV.delete('scheduler:last');
+      // 只重置 running，不再有 last
       await env.NODE_KV.delete('scheduler:running');
       return json({ success: true, message: 'Scheduler reset' });
     }
@@ -211,7 +212,7 @@ async function triggerNode(nodeId, env) {
   }
 }
 
-// ---------- 任务完成 ----------
+// ---------- 任务完成（简化版，无 scheduler:last） ----------
 async function handleTaskDone(nodeId, authToken, env) {
   const node = await env.NODE_KV.get(`node:${nodeId}`, 'json');
   if (!node) return json({ error: `Node ${nodeId} not found` }, 404);
@@ -220,32 +221,22 @@ async function handleTaskDone(nodeId, authToken, env) {
   const allIds = await env.NODE_KV.get('nodes', 'json') || [];
   if (allIds.length === 0) return json({ ok: false, message: 'No nodes registered' }, 200);
 
-  const candidates = [];
-  for (const id of allIds) {
-    if (id === nodeId) continue;
-    const n = await env.NODE_KV.get(`node:${id}`, 'json');
-    if (n && n.enabled !== false) candidates.push({ id, ...n });
-  }
-  if (candidates.length === 0) return json({ ok: false, message: 'No available node' }, 200);
-
-  const lastId = await env.NODE_KV.get('scheduler:last');
-  let startIndex = 0;
-  if (lastId) {
-    const idx = candidates.findIndex(c => c.id === lastId);
-    if (idx !== -1) startIndex = (idx + 1) % candidates.length;
-  }
+  const currentIdx = allIds.indexOf(nodeId);
+  if (currentIdx === -1) return json({ ok: false, message: 'Current node not in list' }, 200);
 
   let lastError = null;
-  for (let i = 0; i < candidates.length; i++) {
-    const idx = (startIndex + i) % candidates.length;
-    const candidate = candidates[idx];
-    const result = await triggerNode(candidate.id, env);
+  for (let i = 1; i <= allIds.length; i++) {
+    const idx = (currentIdx + i) % allIds.length;
+    const id = allIds[idx];
+    const n = await env.NODE_KV.get(`node:${id}`, 'json');
+    if (!n || n.enabled === false) continue;
+
+    const result = await triggerNode(id, env);
     if (result.success) {
-      await env.NODE_KV.put('scheduler:last', candidate.id);
-      return json({ ok: true, triggered: candidate.id, status: result.status });
+      return json({ ok: true, triggered: id, status: result.status });
     } else {
       lastError = result.error;
-      console.warn(`Failed to trigger ${candidate.id}: ${lastError}`);
+      console.warn(`Failed to trigger ${id}: ${lastError}`);
     }
   }
 
@@ -483,7 +474,7 @@ async function setupRepositoryConfig(owner, repo, token, oldConfig, deltaConfig,
   return { success: true };
 }
 
-// ---------- addNode (修复: 显式写入 GH_TOKEN) ----------
+// ---------- addNode ----------
 async function addNode(authToken, body, env) {
   const { owner, repo, workflow, branch, enabled, config } = body;
   const token = authToken;
@@ -514,7 +505,7 @@ async function addNode(authToken, body, env) {
     return json({ error: `GitHub API setup failed: ${result.error}` }, 403);
   }
 
-  // 2. 显式写入 GH_TOKEN (修复: 新增)
+  // 2. 显式写入 GH_TOKEN
   const ghResult = await updateGithubTokenSecret(owner, repo, token, token);
   if (!ghResult.success) {
     return json({ error: `Failed to update GH_TOKEN: ${ghResult.error}` }, 403);
@@ -640,8 +631,7 @@ async function deleteNode(id, authToken, cleanup, env) {
   let list = await env.NODE_KV.get('nodes', 'json') || [];
   list = list.filter(item => item !== id);
   await env.NODE_KV.put('nodes', JSON.stringify(list));
-  const last = await env.NODE_KV.get('scheduler:last');
-  if (last === id) await env.NODE_KV.delete('scheduler:last');
+
   return json({ success: true });
 }
 

@@ -3,6 +3,7 @@
 //  Direct cancel via GitHub API
 //  GH_TOKEN is written via updateGithubTokenSecret on addNode
 //  Scheduling uses node list order, no scheduler:last
+//  CONTROLLER_URL is written as Secret (from config or env default)
 // ============================================================
 
 import * as sealedbox from 'tweetnacl-sealedbox-js';
@@ -117,7 +118,6 @@ export default {
       if (!authToken || authToken !== env.ADMIN_KEY) {
         return json({ error: 'Unauthorized' }, 401);
       }
-      // 只重置 running，不再有 last
       await env.NODE_KV.delete('scheduler:running');
       return json({ success: true, message: 'Scheduler reset' });
     }
@@ -212,7 +212,7 @@ async function triggerNode(nodeId, env) {
   }
 }
 
-// ---------- 任务完成（简化版，无 scheduler:last） ----------
+// ---------- 任务完成 ----------
 async function handleTaskDone(nodeId, authToken, env) {
   const node = await env.NODE_KV.get(`node:${nodeId}`, 'json');
   if (!node) return json({ error: `Node ${nodeId} not found` }, 404);
@@ -340,41 +340,6 @@ async function deleteSecretsConcurrently(owner, repo, token, names) {
   return errors;
 }
 
-// ---------- 设置 CONTROLLER_URL ----------
-async function ensureControllerVariable(owner, repo, token, controllerUrl) {
-  const url = `https://api.github.com/repos/${owner}/${repo}/actions/variables/CONTROLLER_URL`;
-  const headers = {
-    'Authorization': `Bearer ${token}`,
-    'Accept': 'application/vnd.github.v3+json',
-    'User-Agent': USER_AGENT,
-    'Content-Type': 'application/json',
-  };
-  const body = JSON.stringify({ value: controllerUrl });
-
-  const getRes = await fetch(url, { method: 'GET', headers });
-  if (getRes.ok) {
-    const patchRes = await fetch(url, { method: 'PATCH', headers, body });
-    if (!patchRes.ok) {
-      const errText = await patchRes.text();
-      return `Failed to update CONTROLLER_URL: ${patchRes.status} - ${errText}`;
-    }
-    return null;
-  }
-  if (getRes.status === 404) {
-    const postRes = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/actions/variables`,
-      { method: 'POST', headers, body: JSON.stringify({ name: 'CONTROLLER_URL', value: controllerUrl }) }
-    );
-    if (!postRes.ok) {
-      const errText = await postRes.text();
-      return `Failed to create CONTROLLER_URL: ${postRes.status} - ${errText}`;
-    }
-    return null;
-  }
-  const errText = await getRes.text();
-  return `Failed to check CONTROLLER_URL: ${getRes.status} - ${errText}`;
-}
-
 // ---------- 更新 GH_TOKEN ----------
 async function updateGithubTokenSecret(owner, repo, token, newToken) {
   try {
@@ -410,7 +375,6 @@ async function syncSecrets(owner, repo, token, oldConfig, deltaConfig, pubKey, k
   const toDelete = [];
 
   function scheduleSecret(name, value, oldValue) {
-    // GH_TOKEN is handled separately via updateGithubTokenSecret
     if (name === 'GH_TOKEN') {
       errors.push('GH_TOKEN can only be updated via the token field');
       return;
@@ -449,11 +413,7 @@ async function syncSecrets(owner, repo, token, oldConfig, deltaConfig, pubKey, k
 
 // ---------- setupRepositoryConfig ----------
 async function setupRepositoryConfig(owner, repo, token, oldConfig, deltaConfig, env) {
-  const controllerUrl = env.CONTROLLER_URL;
   const errors = [];
-
-  const varError = await ensureControllerVariable(owner, repo, token, controllerUrl);
-  if (varError) errors.push(varError);
 
   let pubKey, keyId;
   try {
@@ -489,18 +449,26 @@ async function addNode(authToken, body, env) {
     return json({ error: 'GH_TOKEN cannot be inside config, use Authorization token' }, 400);
   }
 
+  let finalConfig = config || {};
+  if (!finalConfig.CONTROLLER_URL) {
+    finalConfig = {
+      ...finalConfig,
+      CONTROLLER_URL: env.CONTROLLER_URL
+    };
+  }
+
   const id = `${owner}/${repo}`;
   const node = {
     owner, repo, workflow, token,
     branch: branch || 'main',
     enabled: enabled !== false,
-    config: config || {},
+    config: finalConfig,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
 
-  // 1. 写入普通 Secrets 和 Variables
-  const result = await setupRepositoryConfig(owner, repo, token, {}, config, env);
+  // 1. 写入 Secrets（包括 CONTROLLER_URL）
+  const result = await setupRepositoryConfig(owner, repo, token, {}, finalConfig, env);
   if (!result.success) {
     return json({ error: `GitHub API setup failed: ${result.error}` }, 403);
   }
@@ -601,24 +569,6 @@ async function deleteNode(id, authToken, cleanup, env) {
     const deleteErrors = await deleteSecretsConcurrently(node.owner, node.repo, node.token, allSecrets);
     if (deleteErrors.length > 0) {
       console.warn(`Cleanup errors: ${deleteErrors.join('; ')}`);
-    }
-
-    try {
-      const url = `https://api.github.com/repos/${node.owner}/${node.repo}/actions/variables/CONTROLLER_URL`;
-      const res = await fetch(url, {
-        method: 'DELETE',
-        headers: {
-          'Authorization': `Bearer ${node.token}`,
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': USER_AGENT,
-        }
-      });
-      if (!res.ok && res.status !== 404) {
-        const errText = await res.text();
-        console.warn(`Failed to delete CONTROLLER_URL: ${res.status} - ${errText}`);
-      }
-    } catch (e) {
-      console.warn(`Failed to delete CONTROLLER_URL: ${e.message}`);
     }
   }
 

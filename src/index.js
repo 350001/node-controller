@@ -1,9 +1,9 @@
 // ============================================================
 //  node-controller - Production Stable
 //  Direct cancel via GitHub API
-//  GH_TOKEN is written via updateGithubTokenSecret on addNode
+//  GH_TOKEN written via updateGithubTokenSecret on addNode
 //  Scheduling uses node list order, no scheduler:last
-//  /recover checks actual GitHub run status before recovering
+//  /recover attempts to restart last running node first
 // ============================================================
 
 import * as sealedbox from 'tweetnacl-sealedbox-js';
@@ -136,65 +136,37 @@ export default {
   }
 };
 
-// ---------- 检查 run 是否真的在运行 ----------
-async function checkRunStatus(owner, repo, runId, token) {
-  try {
-    const res = await fetch(
-      `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': USER_AGENT
-        }
-      }
-    );
-    if (!res.ok) {
-      console.warn(`Failed to check run ${runId} status: ${res.status}`);
-      return { running: false, error: `API error: ${res.status}` };
-    }
-    const data = await res.json();
-    const activeStatuses = ['queued', 'in_progress'];
-    return { running: activeStatuses.includes(data.status), status: data.status };
-  } catch (e) {
-    console.warn(`Failed to check run ${runId}: ${e.message}`);
-    return { running: false, error: e.message };
-  }
-}
-
 // ---------- 恢复调度 ----------
 async function recoverScheduler(env) {
   try {
     const running = await env.NODE_KV.get('scheduler:running', 'json');
 
-    // 如果有运行记录，验证它是否真的还在运行
+    // 如果有运行记录，优先尝试恢复该节点
     if (running) {
       const node = await env.NODE_KV.get(`node:${running.node}`, 'json');
-      if (node) {
-        const statusCheck = await checkRunStatus(
-          node.owner,
-          node.repo,
-          running.run_id,
-          node.token
-        );
-
-        if (statusCheck.running) {
+      if (node && node.enabled !== false) {
+        console.log(`🔄 Attempting to recover node ${running.node}`);
+        const result = await triggerNode(running.node, env);
+        if (result.success) {
+          // 触发成功，保持 scheduler:running 不变（新 run_id 由后续 online 更新）
           return json({
             ok: true,
-            message: `Node ${running.node} is still running (status: ${statusCheck.status})`,
-            running
+            triggered: running.node,
+            status: 're-triggered'
           });
         } else {
-          console.log(`🧹 Cleaning stale scheduler:running for ${running.node} (run ${running.run_id})`);
+          console.warn(`Failed to re-trigger ${running.node}: ${result.error}`);
+          // 触发失败，清除残留 running
           await env.NODE_KV.delete('scheduler:running');
         }
       } else {
-        console.log(`🧹 Cleaning stale scheduler:running: node ${running.node} no longer exists`);
+        // 节点不存在或已禁用，清除残留
+        console.log(`🧹 Node ${running.node} invalid, clearing scheduler:running`);
         await env.NODE_KV.delete('scheduler:running');
       }
     }
 
-    // 没有运行节点，触发恢复
+    // 如果没有 running 或恢复失败，fallback 到第一个可用节点
     const allIds = await env.NODE_KV.get('nodes', 'json') || [];
     if (allIds.length === 0) {
       return json({ ok: false, error: 'No nodes registered' }, 404);
@@ -210,7 +182,7 @@ async function recoverScheduler(env) {
     }
 
     if (!firstAvailable) {
-      return json({ ok: false, error: 'No available node found (all disabled)' }, 404);
+      return json({ ok: false, error: 'No available node found' }, 404);
     }
 
     const result = await triggerNode(firstAvailable, env);
@@ -218,7 +190,7 @@ async function recoverScheduler(env) {
       return json({
         ok: true,
         triggered: firstAvailable,
-        status: result.status
+        status: 'triggered'
       });
     } else {
       return json({ ok: false, error: result.error }, 500);

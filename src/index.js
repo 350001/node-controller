@@ -4,6 +4,7 @@
 //  GH_TOKEN written via updateGithubTokenSecret on addNode
 //  Scheduling uses node list order, no scheduler:last
 //  /recover attempts to restart last running node first
+//  Scheduled task checks running node status via GitHub API
 // ============================================================
 
 import * as sealedbox from 'tweetnacl-sealedbox-js';
@@ -133,8 +134,90 @@ export default {
     }
 
     return new Response('Not Found', { status: 404 });
+  },
+
+  // ---- 定时任务 ----
+  async scheduled(event, env, ctx) {
+    console.log("⏰ Scheduled check: verifying running node status");
+
+    try {
+      // 1. 读取 scheduler:running
+      const running = await env.NODE_KV.get('scheduler:running', 'json');
+
+      // 如果没有运行记录，直接退出
+      if (!running) {
+        console.log("No running node, exiting.");
+        return;
+      }
+
+      // 2. 获取节点信息
+      const node = await env.NODE_KV.get(`node:${running.node}`, 'json');
+      if (!node || node.enabled === false) {
+        console.log(`🧹 Node ${running.node} invalid, cleaning and recovering...`);
+        await env.NODE_KV.delete('scheduler:running');
+        await recoverScheduler(env);
+        return;
+      }
+
+      // 3. 通过 GitHub API 检查运行状态（带重试）
+      const statusCheck = await checkRunStatus(
+        node.owner,
+        node.repo,
+        running.run_id,
+        node.token
+      );
+
+      if (statusCheck.running) {
+        console.log(`✅ Node ${running.node} is still running (status: ${statusCheck.status})`);
+      } else {
+        console.log(`🧹 Node ${running.node} is no longer running (${statusCheck.status || 'unknown'}), recovering...`);
+        await env.NODE_KV.delete('scheduler:running');
+        await recoverScheduler(env);
+      }
+    } catch (e) {
+      console.error(`Scheduled check error: ${e.message}`);
+    }
   }
 };
+
+// ---------- 检查 run 是否真的在运行（带重试，3次，间隔2秒） ----------
+async function checkRunStatus(owner, repo, runId, token) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': USER_AGENT
+          }
+        }
+      );
+
+      if (!res.ok) {
+        console.warn(`Check run ${runId} attempt ${attempt}: HTTP ${res.status}`);
+        if (attempt === 3) {
+          return { running: false, error: `API error: ${res.status}` };
+        }
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
+
+      const data = await res.json();
+      const activeStatuses = ['queued', 'in_progress'];
+      return { running: activeStatuses.includes(data.status), status: data.status };
+    } catch (e) {
+      console.warn(`Check run ${runId} attempt ${attempt}: ${e.message}`);
+      if (attempt === 3) {
+        return { running: false, error: e.message };
+      }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+
+  return { running: false, error: 'Max retries exceeded' };
+}
 
 // ---------- 恢复调度 ----------
 async function recoverScheduler(env) {

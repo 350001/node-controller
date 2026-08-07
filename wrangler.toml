@@ -19,3 +19,7 @@ CONTROLLER_URL = "https://controller.zhongguotaiwan.eu.org"
 
 [triggers]
 crons = ["*/10 * * * *"]
+
+[observability.logs]
+enabled = true
+invocation_logs = true

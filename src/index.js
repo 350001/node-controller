@@ -3,7 +3,7 @@
 //  Direct cancel via GitHub API
 //  GH_TOKEN is written via updateGithubTokenSecret on addNode
 //  Scheduling uses node list order, no scheduler:last
-//  CONTROLLER_URL is written as Secret (from config or env default)
+//  /recover checks actual GitHub run status before recovering
 // ============================================================
 
 import * as sealedbox from 'tweetnacl-sealedbox-js';
@@ -52,6 +52,7 @@ export default {
     const method = request.method;
     const authToken = getBearerToken(request);
 
+    // ---- 节点操作 ----
     if (method === 'POST' && path === '/nodes') {
       if (!authToken) return json({ error: 'Missing Authorization header' }, 401);
       try {
@@ -107,6 +108,7 @@ export default {
       }
     }
 
+    // ---- 管理操作 ----
     if (method === 'GET' && path === '/nodes') {
       if (!authToken || authToken !== env.ADMIN_KEY) {
         return json({ error: 'Unauthorized' }, 401);
@@ -122,9 +124,109 @@ export default {
       return json({ success: true, message: 'Scheduler reset' });
     }
 
+    // ---- 手动恢复 ----
+    if (method === 'POST' && path === '/recover') {
+      if (!authToken || authToken !== env.ADMIN_KEY) {
+        return json({ error: 'Unauthorized' }, 401);
+      }
+      return recoverScheduler(env);
+    }
+
     return new Response('Not Found', { status: 404 });
   }
 };
+
+// ---------- 检查 run 是否真的在运行 ----------
+async function checkRunStatus(owner, repo, runId, token) {
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': USER_AGENT
+        }
+      }
+    );
+    if (!res.ok) {
+      console.warn(`Failed to check run ${runId} status: ${res.status}`);
+      return { running: false, error: `API error: ${res.status}` };
+    }
+    const data = await res.json();
+    const activeStatuses = ['queued', 'in_progress'];
+    return { running: activeStatuses.includes(data.status), status: data.status };
+  } catch (e) {
+    console.warn(`Failed to check run ${runId}: ${e.message}`);
+    return { running: false, error: e.message };
+  }
+}
+
+// ---------- 恢复调度 ----------
+async function recoverScheduler(env) {
+  try {
+    const running = await env.NODE_KV.get('scheduler:running', 'json');
+
+    // 如果有运行记录，验证它是否真的还在运行
+    if (running) {
+      const node = await env.NODE_KV.get(`node:${running.node}`, 'json');
+      if (node) {
+        const statusCheck = await checkRunStatus(
+          node.owner,
+          node.repo,
+          running.run_id,
+          node.token
+        );
+
+        if (statusCheck.running) {
+          return json({
+            ok: true,
+            message: `Node ${running.node} is still running (status: ${statusCheck.status})`,
+            running
+          });
+        } else {
+          console.log(`🧹 Cleaning stale scheduler:running for ${running.node} (run ${running.run_id})`);
+          await env.NODE_KV.delete('scheduler:running');
+        }
+      } else {
+        console.log(`🧹 Cleaning stale scheduler:running: node ${running.node} no longer exists`);
+        await env.NODE_KV.delete('scheduler:running');
+      }
+    }
+
+    // 没有运行节点，触发恢复
+    const allIds = await env.NODE_KV.get('nodes', 'json') || [];
+    if (allIds.length === 0) {
+      return json({ ok: false, error: 'No nodes registered' }, 404);
+    }
+
+    let firstAvailable = null;
+    for (const id of allIds) {
+      const n = await env.NODE_KV.get(`node:${id}`, 'json');
+      if (n && n.enabled !== false) {
+        firstAvailable = id;
+        break;
+      }
+    }
+
+    if (!firstAvailable) {
+      return json({ ok: false, error: 'No available node found (all disabled)' }, 404);
+    }
+
+    const result = await triggerNode(firstAvailable, env);
+    if (result.success) {
+      return json({
+        ok: true,
+        triggered: firstAvailable,
+        status: result.status
+      });
+    } else {
+      return json({ ok: false, error: result.error }, 500);
+    }
+  } catch (e) {
+    return json({ ok: false, error: e.message }, 500);
+  }
+}
 
 // ---------- 取消 GitHub Actions 运行 ----------
 async function cancelWorkflowRun(owner, repo, runId, token) {
@@ -467,13 +569,11 @@ async function addNode(authToken, body, env) {
     updatedAt: Date.now(),
   };
 
-  // 1. 写入 Secrets（包括 CONTROLLER_URL）
   const result = await setupRepositoryConfig(owner, repo, token, {}, finalConfig, env);
   if (!result.success) {
     return json({ error: `GitHub API setup failed: ${result.error}` }, 403);
   }
 
-  // 2. 显式写入 GH_TOKEN
   const ghResult = await updateGithubTokenSecret(owner, repo, token, token);
   if (!ghResult.success) {
     return json({ error: `Failed to update GH_TOKEN: ${ghResult.error}` }, 403);
